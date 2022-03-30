@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>Gandalf</title>
+		<style>
+		body {
+			margin: 0 0;
+			padding: 0 0;
+		}
+		
+		div.gandalf-video {
+			display: block;
+		}
+
+		div.gandalf-video > video {
+			display: block;
+			width: 100%;
+			height: 100%;
+		}
+
+		</style>
+		<script type="text/javascript">
+		/* "A wizard is never late, nor is he early, he arrives precisely when he means to." */
+		
+		window.AudioContext = window.AudioContext || window.webkitAudioContext;
+		
+		//Media must be a "good enough" loop
+		const SOUND_URL = './epic_sax_guy.wav';
+		const VIDEO_URL = 'anim1.mp4';
+		
+		//If you want to run all connected instances at once using P2P, set to false
+		const GANDALF_AUTOPLAY = true;
+		//Display debug canvas below video
+		const GANDALF_DEBUG_ENABLE = true;
+		
+		class SynchronizedAudioPlayer {
+			#START_BPM = 131;
+			constructor(autostart = true) {
+				this.autostart = autostart;
+				this.context = new AudioContext();
+				
+				//Audio source
+				this.aud = new Audio();
+				//MediaSource Node: Connects to the audio element
+				this.src = this.context.createMediaElementSource(this.aud);
+				
+				//Lowpass Biquad filter to detect beats
+				//this.filter0 = this.context.createBiquadFilter(); this.filter0.type = "lowpass";
+				//FFT analyzer
+				//this.fft0 = this.context.createAnalyser(); this.fft0.fftSize = 2048;
+
+				//Destination Node: Device Speakers for AudioContext or AudioBuffer for OfflineAudioContext
+				this.dest = this.context.destination;
+				
+				/**
+				 * Connection:
+				 * Source node[Audio element]	-+-> Destination node[Speaker]
+				 *								 +-> BiquadFilter[Lowpass] -> AudioBuffer node
+				 */
+				//TODO: once I figure out how to do this, connect properly
+				this.src.connect(this.dest);
+				//this.src.connect(this.filter0);
+				//this.filter0.connect(this.fft0);
+
+				//Never allow to pause
+				this.aud.addEventListener('pause', event => this.aud.play());
+				
+				this.bpm = this.#START_BPM;
+				this.beat_start_time = 0;
+				this.last_ct = this.beat_start_time;
+				setInterval(this.#bpmPulse.bind(this), 20);
+			}
+			
+			#bpmPulse() {
+				if (this.last_ct > this.aud.currentTime)
+					this.last_ct = this.beat_start_time;
+				else if (this.aud.currentTime - this.last_ct >= 60 / (this.bpm * this.aud.playbackRate))
+					this.last_ct = this.aud.currentTime;
+				this.syncBeat(this.aud.currentTime, (this.aud.currentTime - this.last_ct) * (this.bpm*this.aud.playbackRate) / 60);
+			}
+			
+			async load(url) {
+				this.aud.src = url;
+				this.aud.loop = true;
+				this.aud.playbackRate = 1;
+				await new Promise((resolve, reject) => {
+					this.aud.addEventListener('canplay', event => {
+						if (this.autostart)
+							this.play();
+						resolve();
+					});
+					this.aud.addEventListener('error', event => reject());
+				});
+			}
+
+			/* Start playing */
+			play() {
+				this.aud.play();
+			}
+			
+			/* Data to let other Peers know when to sync */
+			getSyncData() {
+				return {
+					pos: this.aud.currentTime
+				}
+			}
+			
+			/* To sync video with the song's beat phase */
+			syncBeat(audio_time, beat_phase) {}
+		}
+
+		class GandalfPlayer extends SynchronizedAudioPlayer {
+			#PLL_PARAM_TUNE_RATE = 0.1;
+			#PLL_FREQ_DIVIDE = 1;
+			#PLL_RATE_BIAS = 1;
+			
+			constructor(autostart, show_debug = false) {
+				super(autostart);
+				this.sync_acc = 1;
+				this.show_debug = show_debug;
+				this.phase_hist = [];
+				this.vid_container = document.createElement('div');
+				this.vid_container.className = "gandalf-video";
+				this.vid = document.createElement('video');
+				this.vid_container.appendChild(this.vid);
+				this.dbg = new DebugPhaseRenderer();
+			}
+			
+			add(elem) {
+				elem.appendChild(this.vid_container);
+				
+				if (this.show_debug) {
+					this.dbg.add(elem);
+					this.dbg.beginRendering();
+				}
+			}
+
+			async #load_video(vid_url) {
+				this.vid.src = vid_url;
+				this.vid.style.display = "none";
+				this.vid.loop = true;
+				this.sync_acc = 1;
+				return new Promise((resolve, reject) => {
+					this.vid.addEventListener('canplay', event => resolve());
+					this.vid.addEventListener('error', event => reject());
+				});
+			}
+			
+			async load(audio_url, vid_url) {
+				let aud_promise = super.load(audio_url);
+				let vid_promise = this.#load_video(vid_url);
+				await aud_promise;
+				await vid_promise;
+			}
+
+			play() {
+				super.play();
+				this.vid.style.removeProperty("display")
+				this.vid.play();
+			}
+
+			fullscreenToggle() {
+				if (!document.fullscreenElement)
+					this.vid_container.requestFullscreen();
+				else
+					document.exitFullscreen();
+			}
+			
+			//Sync video using a PLL
+			syncBeat(audio_time, beat_phase) {
+				let vid_phase = (this.vid.currentTime / this.vid.duration);
+				
+				let v_phang = vid_phase * 2 * Math.PI;
+				let b_phang = beat_phase * 2 * Math.PI;
+				
+				let v_phsq = vid_phase > 0.5;
+				//Frequency divide
+				while (beat_phase > 1 / this.#PLL_FREQ_DIVIDE) beat_phase -= 1 / this.#PLL_FREQ_DIVIDE;
+				let b_phsq = beat_phase > 0.5 / this.#PLL_FREQ_DIVIDE;
+				
+				let phase_diff = v_phsq ^ b_phsq;
+				
+				this.dbg.setPhase1(v_phang);
+				this.dbg.setPhase2(b_phang);
+
+				if (Number.isNaN(phase_diff)) phase_diff = 0;
+				this.phase_hist.push(phase_diff);
+				if (this.phase_hist.length > 200) this.phase_hist.shift();
+				
+				if (this.phase_hist.length > 0)
+					this.sync_acc = this.phase_hist.reduce((a, x) => a+x) / this.phase_hist.length;
+				
+				let phase_error = 2*(this.sync_acc - 0.5);
+				this.dbg.setPhaseDiff(phase_error);
+
+				//Plotting phase graph
+				this.dbg.phHist({p: phase_diff, m: this.sync_acc});
+
+
+				//FIXME: Improve this, doesn't seem to work. This magic number seems to be pretty okay for now
+				
+				//It (phase difference) should approach 0 when this function is called, so we need to change playback rate using feedback
+				//let x = this.#PLL_RATE_BIAS + phase_error * this.#PLL_PARAM_TUNE_RATE;
+				//this.vid.playbackRate = Math.max(0.25, Math.min(x, 4));
+				this.vid.playbackRate = 0.928;
+			}
+		}
+
+		class DebugPhaseRenderer {
+			constructor() {
+				this.ca = document.createElement('canvas');
+				this.ctx = this.ca.getContext('2d');
+				this.ca.width = 600;
+				this.ca.height = 200;
+				this.phase1 = 0;
+				this.phase2 = 0;
+				this.phase_diff = 0;
+				this.phase_hist = [];
+			}
+
+			add(elem) {
+				elem.appendChild(this.ca);
+			}
+
+			setPhase1(phase) {
+				this.phase1 = phase;
+			}
+
+			setPhase2(phase) {
+				this.phase2 = phase;
+			}
+
+			setPhaseDiff(pd) {
+				this.phase_diff = pd;
+			}
+
+			phHist(hist_data) {
+				this.phase_hist.push(hist_data);
+			}
+
+			beginRendering() {
+				window.requestAnimationFrame(this.render.bind(this));
+			}
+
+			render(ts) {
+				let px, py;
+				this.ctx.clearRect(0, 0, this.ca.width, this.ca.height);
+				
+				while (this.phase_hist.length > this.ca.width-40) this.phase_hist.shift();
+				
+				this.ctx.strokeStyle = "black";
+				
+				this.ctx.beginPath();
+				this.ctx.fillStyle = "red";
+				px = 40 + Math.cos(this.phase1) * 20;
+				py = 40 + Math.sin(this.phase1) * 20;
+				this.ctx.arc(px, py, 5, 0, 2*Math.PI);
+				this.ctx.fill();
+				
+				this.ctx.beginPath();
+				this.ctx.fillStyle = "green";
+				px = 40 + Math.cos(this.phase2) * 20;
+				py = 40 + Math.sin(this.phase2) * 20;
+				this.ctx.arc(px, py, 5, 0, 2*Math.PI);
+				this.ctx.fill();
+				
+				this.ctx.strokeRect(40 - 20, 110, 40, 20);
+				this.ctx.beginPath();
+				this.ctx.fillStyle = "yellow";
+				px = 40 + this.phase_diff * 10;
+				this.ctx.arc(px, 120, 10, 0, 2*Math.PI);
+				this.ctx.fill();
+
+				this.ctx.beginPath();
+				for (let x = 0; x < this.phase_hist.length; x++) {
+					let px = 20+x;
+					let py = 100 - this.phase_hist[x].p * 30;
+					if (x === 0)
+						this.ctx.moveTo(px, py);
+					else
+						this.ctx.lineTo(px, py);
+				}
+				this.ctx.stroke();
+				this.ctx.beginPath();
+				this.ctx.strokeStyle = "red";
+				for (let x = 0; x < this.phase_hist.length; x++) {
+					let px = 20+x;
+					let py = 100 - this.phase_hist[x].m * 30;
+					if (x === 0)
+						this.ctx.moveTo(px, py);
+					else
+						this.ctx.lineTo(px, py);
+				}
+				this.ctx.stroke();
+				
+				window.requestAnimationFrame(this.render.bind(this));
+			}
+		}
+
+
+		//https://www.youtube.com/watch?v=t-_VPRCtiUg
+		
+		//TODO: Generalize this class
+		
+		//Synchronize a player by crowd averaging over WebRTC P2P
+		class WRTCSynchronizer {
+			constructor(player) {
+				this.player = player;
+				this.itv = null;
+				//Local peer connection
+				this.pcon = new RTCPeerConnection();
+				//All remote connections that connect to us. Key is the offer SDP
+				this.remotes = {};
+				//Just one sync channel for timestamps. We can't share audio as that will kill the bandwidth
+				this.sync_channel = this.pcon.createDataChannel('sync');
+				this.#generateLocalOffer().then(offer => this.#letTheWorldKnow(offer));
+				//Fullscreen only possible with user-event
+				window.addEventListener('dblclick', () => {
+					this.player.fullscreenToggle();
+				});
+			}
+			
+			start() {
+				this.itv = setInterval(this.#synchronizeSend.bind(this), 1000);
+			}
+			
+			stop() {
+				clearTimeout(this.itv);
+				this.itv = null;
+			}
+			
+			#generateLocalOffer() {
+				return new Promise((resolve, reject) => {
+					this.pcon.createOffer()
+					.then(offer => this.pcon.setLocalDescription(offer))
+					.then(() => resolve(this.pcon.localDescription))
+					.catch(reject);
+				});
+			}
+			
+			#letTheWorldKnow(localOffer) {
+				//We can let other peers know about our existence by any means, as long as this offer is sent to them
+				//console.log(localOffer);
+				//setTimeout(() =>this.player.play(), 2000);
+			}
+			
+			#synchronizeSend() {
+				//console.log(SOUND_BPM);
+				//let real_aud_time = this.player.aud.currentTime;
+				
+			}
+			
+			//TODO: synchronizeRecv
+			#synchronizeRecv() {  }
+		}
+		
+		//Initialize
+		const gd = new GandalfPlayer(GANDALF_AUTOPLAY, GANDALF_DEBUG_ENABLE);
+		const sync = new WRTCSynchronizer(gd);
+		gd.load(SOUND_URL, VIDEO_URL).then(() => sync.start());
+		window.addEventListener('load', ()=>gd.add(document.body));
+		</script>
+	</head>
+	<body></body>
+</html>
